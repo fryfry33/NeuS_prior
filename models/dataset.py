@@ -4,19 +4,17 @@ import cv2 as cv
 import numpy as np
 import os
 from glob import glob
-from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 
-
-# This function is borrowed from IDR: https://github.com/lioryariv/idr
 def load_K_Rt_from_P(filename, P=None):
     if P is None:
         lines = open(filename).read().splitlines()
         if len(lines) == 4:
-            lines = lines[1:]
-        lines = [[x[0], x[1], x[2], x[3]] for x in (x.split(" ") for x in lines)]
-        P = np.asarray(lines).astype(np.float32).squeeze()
+            lines = lines[0].split(' ')[:16]
+        else:
+            lines = lines[0].split(' ')[:16]
+        P = np.array(lines).astype(np.float32).reshape(4, 4)[:3]
 
     out = cv.decomposeProjectionMatrix(P)
     K = out[0]
@@ -32,7 +30,6 @@ def load_K_Rt_from_P(filename, P=None):
     pose[:3, 3] = (t[:3] / t[3])[:, 0]
 
     return intrinsics, pose
-
 
 class Dataset:
     def __init__(self, conf):
@@ -51,38 +48,67 @@ class Dataset:
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
         
-        # --- MODIFICATION ICI : Recherche JPG et PNG ---
+        # --- 1. CHARGEMENT IMAGES (PNG/JPG) ---
         image_dir = os.path.join(self.data_dir)
-        self.images_lis = sorted(glob(os.path.join(image_dir, '*.png')) + 
-                                 glob(os.path.join(image_dir, '*.jpg')) + 
-                                 glob(os.path.join(image_dir, '*.jpeg')))
+        files = sorted(glob(os.path.join(image_dir, '*.png')) + 
+                       glob(os.path.join(image_dir, '*.jpg')) + 
+                       glob(os.path.join(image_dir, '*.jpeg')))
         
+        # Tri numérique pour gérer l'ordre 1, 2, 10 correctement
+        try:
+            files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+        except ValueError:
+            files.sort()
+
+        self.images_lis = files
         self.n_images = len(self.images_lis)
         if self.n_images == 0:
-            raise ValueError(f"Aucune image trouvée dans {image_dir}. Vérifiez l'extension !")
+            raise ValueError(f"Aucune image trouvée dans {image_dir}")
 
-        # Chargement des images
+        # Chargement en mémoire RAM (CPU)
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
 
-        # --- MODIFICATION MASQUES : Sécurité si pas de masques ---
+        # --- 2. CHARGEMENT MASQUES ---
         mask_dir = os.path.join(self.data_dir, 'mask')
-        self.masks_lis = sorted(glob(os.path.join(mask_dir, '*.png')) + 
-                                glob(os.path.join(mask_dir, '*.jpg')))
+        mask_files = sorted(glob(os.path.join(mask_dir, '*.png')) + 
+                            glob(os.path.join(mask_dir, '*.jpg')))
 
-        if len(self.masks_lis) > 0:
-            self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        if len(mask_files) > 0:
+            try:
+                mask_files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+            except:
+                mask_files.sort()
+            self.masks_np = np.stack([cv.imread(im_name) for im_name in mask_files]) / 256.0
         else:
-            print("Info: Aucun masque trouvé, utilisation de masques blancs (tout visible).")
-            # Crée des masques blancs de la même taille que les images
+            print("Info: Aucun masque trouvé, utilisation de masques blancs.")
             self.masks_np = np.ones_like(self.images_np)
 
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
-
+        # --- 3. CHARGEMENT MATRICES (CORRECTION ID) ---
+        self.world_mats_np = []
         self.scale_mats_np = []
 
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+        # Au lieu de faire un range(n), on parcourt les fichiers réels
+        print("Mapping Images -> Cameras...")
+        for img_path in self.images_lis:
+            # Extraction ID : "path/4.jpg" -> "4"
+            basename = os.path.basename(img_path)
+            file_id_str = os.path.splitext(basename)[0]
+            
+            # Gestion des zéros non significatifs (04 -> 4) si besoin
+            try:
+                key_id = str(int(file_id_str))
+            except ValueError:
+                key_id = file_id_str
+            
+            world_key = f'world_mat_{key_id}'
+            scale_key = f'scale_mat_{key_id}'
+
+            # Sécurité : Vérifie si la clé existe dans le .npz
+            if world_key not in camera_dict:
+                raise KeyError(f"ERREUR CRITIQUE: L'image {basename} cherche la clé '{world_key}' dans cameras_sphere.npz, mais elle n'existe pas.")
+
+            self.world_mats_np.append(camera_dict[world_key].astype(np.float32))
+            self.scale_mats_np.append(camera_dict[scale_key].astype(np.float32))
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -94,19 +120,22 @@ class Dataset:
             self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
             self.pose_all.append(torch.from_numpy(pose).float())
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
-        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
+        # IMAGES SUR CPU (RAM)
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()
+        
+        # MATRICES SUR GPU (VRAM)
+        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)
+        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
+        self.pose_all = torch.stack(self.pose_all).to(self.device)
+        
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
+        object_scale_mat = self.scale_mats_np[0]
         object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
@@ -115,84 +144,48 @@ class Dataset:
         print('Load data: End')
 
     def gen_rays_at(self, img_idx, resolution_level=1):
-        """
-        Generate rays at world space from one camera.
-        """
         l = resolution_level
         tx = torch.linspace(0, self.W - 1, self.W // l)
         ty = torch.linspace(0, self.H - 1, self.H // l)
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
-        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
-        rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
-        rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).to(self.device)
+        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()
+        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
+        rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()
+        rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
 
     def gen_random_rays_at(self, img_idx, batch_size):
-        # --- CORRECTION BLINDÉE CPU/GPU ---
+        # --- FIX CPU/GPU ---
         
-        # 1. Convertir l'index image en entier Python PUR
-        # Si c'est un Tensor GPU, on le ramène sur CPU et on prend sa valeur
+        # 1. Conversion index image -> Entier pur
         if isinstance(img_idx, torch.Tensor):
             img_idx = img_idx.cpu().item()
             
-        # 2. Générer les indices de pixels EXPLICITEMENT sur CPU
-        # L'argument device='cpu' force la création en RAM, peu importe le default_tensor_type
+        # 2. Génération indices pixels -> FORCÉE SUR CPU
+        # device='cpu' est indispensable ici car NeuS met le tenseur par défaut sur CUDA
         pixels_x = torch.randint(low=0, high=self.W, size=(batch_size,), device='cpu')
         pixels_y = torch.randint(low=0, high=self.H, size=(batch_size,), device='cpu')
         
-        # 3. Lire les données (Tout est sur CPU ici : images, index image, indices pixels)
-        # self.images est sur CPU. pixels_x/y sont sur CPU. img_idx est int. -> Pas de crash.
+        # 3. Lecture des données (Tout est sur CPU)
         color = self.images[img_idx][(pixels_y, pixels_x)]
         mask = self.masks[img_idx][(pixels_y, pixels_x)]
         
-        # 4. Envoyer sur GPU pour les calculs géométriques
+        # 4. Envoi sur GPU pour les maths
         p_x = pixels_x.to(self.device).float()
         p_y = pixels_y.to(self.device).float()
         
         p = torch.stack([p_x, p_y, torch.ones_like(p_y)], dim=-1)
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze()
-        
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape)
         
         return torch.cat([rays_o, rays_v, color.to(self.device), mask[:, :1].to(self.device)], dim=-1)
-    
-    def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
-        """
-        Interpolate pose between two cameras.
-        """
-        l = resolution_level
-        tx = torch.linspace(0, self.W - 1, self.W // l)
-        ty = torch.linspace(0, self.H - 1, self.H // l)
-        pixels_x, pixels_y = torch.meshgrid(tx, ty)
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)  # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
-        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
-        trans = self.pose_all[idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[idx_1, :3, 3] * ratio
-        pose_0 = self.pose_all[idx_0].detach().cpu().numpy()
-        pose_1 = self.pose_all[idx_1].detach().cpu().numpy()
-        pose_0 = np.linalg.inv(pose_0)
-        pose_1 = np.linalg.inv(pose_1)
-        rot_0 = pose_0[:3, :3]
-        rot_1 = pose_1[:3, :3]
-        rots = Rot.from_matrix(np.stack([rot_0, rot_1]))
-        key_times = [0, 1]
-        slerp = Slerp(key_times, rots)
-        rot = slerp(ratio)
-        pose = np.diag([1.0, 1.0, 1.0, 1.0])
-        pose = pose.astype(np.float32)
-        pose[:3, :3] = rot.as_matrix()
-        pose[:3, 3] = ((1.0 - ratio) * pose_0 + ratio * pose_1)[:3, 3]
-        pose = np.linalg.inv(pose)
-        rot = torch.from_numpy(pose[:3, :3]).cuda()
-        trans = torch.from_numpy(pose[:3, 3]).cuda()
-        rays_v = torch.matmul(rot[None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
-        rays_o = trans[None, None, :3].expand(rays_v.shape)  # W, H, 3
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
 
+    def get_resolution(self, img_idx):
+        return self.W, self.H
+        
     def near_far_from_sphere(self, rays_o, rays_d):
         a = torch.sum(rays_d**2, dim=-1, keepdim=True)
         b = 2.0 * torch.sum(rays_o * rays_d, dim=-1, keepdim=True)
@@ -200,8 +193,3 @@ class Dataset:
         near = mid - 1.0
         far = mid + 1.0
         return near, far
-
-    def image_at(self, idx, resolution_level):
-        img = cv.imread(self.images_lis[idx])
-        return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
-
