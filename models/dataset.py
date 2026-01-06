@@ -51,38 +51,73 @@ class Dataset:
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
         
-        # --- MODIFICATION ICI : Recherche JPG et PNG ---
+        # 1. Chargement des images (PNG, JPG, JPEG)
         image_dir = os.path.join(self.data_dir)
-        self.images_lis = sorted(glob(os.path.join(image_dir, '*.png')) + 
-                                 glob(os.path.join(image_dir, '*.jpg')) + 
-                                 glob(os.path.join(image_dir, '*.jpeg')))
+        # On utilise une liste triée numériquement si possible pour éviter l'ordre 1, 10, 2...
+        # Mais le glob de base trie par string.
+        files = sorted(glob(os.path.join(image_dir, '*.png')) + 
+                       glob(os.path.join(image_dir, '*.jpg')) + 
+                       glob(os.path.join(image_dir, '*.jpeg')))
         
-        self.n_images = len(self.images_lis)
-        if self.n_images == 0:
-            raise ValueError(f"Aucune image trouvée dans {image_dir}. Vérifiez l'extension !")
+        # Tri numérique des fichiers (ex: 2.jpg avant 10.jpg)
+        # Cela suppose que les noms de fichiers sont des nombres (0.jpg, 1.jpg...)
+        try:
+            files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+        except ValueError:
+            print("Attention : Les noms de fichiers ne sont pas purement numériques, tri alphabétique utilisé.")
+            files.sort()
 
-        # Chargement des images
+        self.images_lis = files
+        self.n_images = len(self.images_lis)
+        
+        if self.n_images == 0:
+            raise ValueError(f"Aucune image trouvée dans {image_dir}")
+
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
 
-        # --- MODIFICATION MASQUES : Sécurité si pas de masques ---
+        # 2. Gestion des Masques
         mask_dir = os.path.join(self.data_dir, 'mask')
-        self.masks_lis = sorted(glob(os.path.join(mask_dir, '*.png')) + 
-                                glob(os.path.join(mask_dir, '*.jpg')))
+        mask_files = sorted(glob(os.path.join(mask_dir, '*.png')) + 
+                            glob(os.path.join(mask_dir, '*.jpg')))
 
-        if len(self.masks_lis) > 0:
-            self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        if len(mask_files) > 0:
+            # On essaie de trier les masques comme les images
+            try:
+                mask_files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+            except:
+                mask_files.sort()
+            self.masks_np = np.stack([cv.imread(im_name) for im_name in mask_files]) / 256.0
         else:
-            print("Info: Aucun masque trouvé, utilisation de masques blancs (tout visible).")
-            # Crée des masques blancs de la même taille que les images
+            print("Info: Aucun masque trouvé, création de masques blancs.")
             self.masks_np = np.ones_like(self.images_np)
 
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
-
+        # 3. CORRECTION MAJEURE : Chargement des matrices par ID de fichier
+        self.world_mats_np = []
         self.scale_mats_np = []
 
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+        print("Mapping Images -> Cameras...")
+        for img_path in self.images_lis:
+            # On récupère le nom du fichier : "4.jpg" -> "4"
+            basename = os.path.basename(img_path)
+            file_id_str = os.path.splitext(basename)[0]
+            
+            # On essaie de convertir en int pour enlever les zéros (ex: "04" -> "4")
+            # car le JSON avait des clés "4", pas "04"
+            try:
+                key_id = str(int(file_id_str))
+            except ValueError:
+                key_id = file_id_str
+            
+            # On construit la clé attendue dans le NPZ
+            world_key = f'world_mat_{key_id}'
+            scale_key = f'scale_mat_{key_id}'
+
+            # Vérification de sécurité
+            if world_key not in camera_dict:
+                raise KeyError(f"L'image '{basename}' n'a pas de caméra '{world_key}' correspondante dans cameras_sphere.npz")
+
+            self.world_mats_np.append(camera_dict[world_key].astype(np.float32))
+            self.scale_mats_np.append(camera_dict[scale_key].astype(np.float32))
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -94,19 +129,21 @@ class Dataset:
             self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
             self.pose_all.append(torch.from_numpy(pose).float())
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
-        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()
+        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)
+        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
+        self.pose_all = torch.stack(self.pose_all).to(self.device)
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
+        
+        # On utilise la première matrice scale disponible pour la bounding box
+        object_scale_mat = self.scale_mats_np[0]
+        
         object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
