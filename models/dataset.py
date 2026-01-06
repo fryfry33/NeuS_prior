@@ -52,7 +52,7 @@ class Dataset:
         self.camera_dict = camera_dict
         
         # --- MODIFICATION ICI : Recherche JPG et PNG ---
-        image_dir = os.path.join(self.data_dir, 'image')
+        image_dir = os.path.join(self.data_dir)
         self.images_lis = sorted(glob(os.path.join(image_dir, '*.png')) + 
                                  glob(os.path.join(image_dir, '*.jpg')) + 
                                  glob(os.path.join(image_dir, '*.jpeg')))
