@@ -50,11 +50,31 @@ class Dataset:
 
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+        
+        # --- MODIFICATION ICI : Recherche JPG et PNG ---
+        image_dir = os.path.join(self.data_dir, 'image')
+        self.images_lis = sorted(glob(os.path.join(image_dir, '*.png')) + 
+                                 glob(os.path.join(image_dir, '*.jpg')) + 
+                                 glob(os.path.join(image_dir, '*.jpeg')))
+        
         self.n_images = len(self.images_lis)
+        if self.n_images == 0:
+            raise ValueError(f"Aucune image trouvée dans {image_dir}. Vérifiez l'extension !")
+
+        # Chargement des images
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+
+        # --- MODIFICATION MASQUES : Sécurité si pas de masques ---
+        mask_dir = os.path.join(self.data_dir, 'mask')
+        self.masks_lis = sorted(glob(os.path.join(mask_dir, '*.png')) + 
+                                glob(os.path.join(mask_dir, '*.jpg')))
+
+        if len(self.masks_lis) > 0:
+            self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        else:
+            print("Info: Aucun masque trouvé, utilisation de masques blancs (tout visible).")
+            # Crée des masques blancs de la même taille que les images
+            self.masks_np = np.ones_like(self.images_np)
 
         # world_mat is a projection matrix from world to image
         self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
