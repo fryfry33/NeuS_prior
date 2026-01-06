@@ -51,73 +51,38 @@ class Dataset:
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
         
-        # 1. Chargement des images (PNG, JPG, JPEG)
+        # --- MODIFICATION ICI : Recherche JPG et PNG ---
         image_dir = os.path.join(self.data_dir)
-        # On utilise une liste triée numériquement si possible pour éviter l'ordre 1, 10, 2...
-        # Mais le glob de base trie par string.
-        files = sorted(glob(os.path.join(image_dir, '*.png')) + 
-                       glob(os.path.join(image_dir, '*.jpg')) + 
-                       glob(os.path.join(image_dir, '*.jpeg')))
+        self.images_lis = sorted(glob(os.path.join(image_dir, '*.png')) + 
+                                 glob(os.path.join(image_dir, '*.jpg')) + 
+                                 glob(os.path.join(image_dir, '*.jpeg')))
         
-        # Tri numérique des fichiers (ex: 2.jpg avant 10.jpg)
-        # Cela suppose que les noms de fichiers sont des nombres (0.jpg, 1.jpg...)
-        try:
-            files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-        except ValueError:
-            print("Attention : Les noms de fichiers ne sont pas purement numériques, tri alphabétique utilisé.")
-            files.sort()
-
-        self.images_lis = files
         self.n_images = len(self.images_lis)
-        
         if self.n_images == 0:
-            raise ValueError(f"Aucune image trouvée dans {image_dir}")
+            raise ValueError(f"Aucune image trouvée dans {image_dir}. Vérifiez l'extension !")
 
+        # Chargement des images
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
 
-        # 2. Gestion des Masques
+        # --- MODIFICATION MASQUES : Sécurité si pas de masques ---
         mask_dir = os.path.join(self.data_dir, 'mask')
-        mask_files = sorted(glob(os.path.join(mask_dir, '*.png')) + 
-                            glob(os.path.join(mask_dir, '*.jpg')))
+        self.masks_lis = sorted(glob(os.path.join(mask_dir, '*.png')) + 
+                                glob(os.path.join(mask_dir, '*.jpg')))
 
-        if len(mask_files) > 0:
-            # On essaie de trier les masques comme les images
-            try:
-                mask_files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-            except:
-                mask_files.sort()
-            self.masks_np = np.stack([cv.imread(im_name) for im_name in mask_files]) / 256.0
+        if len(self.masks_lis) > 0:
+            self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
         else:
-            print("Info: Aucun masque trouvé, création de masques blancs.")
+            print("Info: Aucun masque trouvé, utilisation de masques blancs (tout visible).")
+            # Crée des masques blancs de la même taille que les images
             self.masks_np = np.ones_like(self.images_np)
 
-        # 3. CORRECTION MAJEURE : Chargement des matrices par ID de fichier
-        self.world_mats_np = []
+        # world_mat is a projection matrix from world to image
+        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+
         self.scale_mats_np = []
 
-        print("Mapping Images -> Cameras...")
-        for img_path in self.images_lis:
-            # On récupère le nom du fichier : "4.jpg" -> "4"
-            basename = os.path.basename(img_path)
-            file_id_str = os.path.splitext(basename)[0]
-            
-            # On essaie de convertir en int pour enlever les zéros (ex: "04" -> "4")
-            # car le JSON avait des clés "4", pas "04"
-            try:
-                key_id = str(int(file_id_str))
-            except ValueError:
-                key_id = file_id_str
-            
-            # On construit la clé attendue dans le NPZ
-            world_key = f'world_mat_{key_id}'
-            scale_key = f'scale_mat_{key_id}'
-
-            # Vérification de sécurité
-            if world_key not in camera_dict:
-                raise KeyError(f"L'image '{basename}' n'a pas de caméra '{world_key}' correspondante dans cameras_sphere.npz")
-
-            self.world_mats_np.append(camera_dict[world_key].astype(np.float32))
-            self.scale_mats_np.append(camera_dict[scale_key].astype(np.float32))
+        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
+        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -129,21 +94,19 @@ class Dataset:
             self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
             self.pose_all.append(torch.from_numpy(pose).float())
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)
-        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
+        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
+        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)
+        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        
-        # On utilise la première matrice scale disponible pour la bounding box
-        object_scale_mat = self.scale_mats_np[0]
-        
+        # Object scale mat: region of interest to **extract mesh**
+        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
         object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
@@ -167,20 +130,36 @@ class Dataset:
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
 
     def gen_random_rays_at(self, img_idx, batch_size):
-        """
-        Generate random rays at world space from one camera.
-        """
-        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
-        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
-        color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
-        mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
-        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
-        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
-        rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
-        rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
-
+        # --- CORRECTION BLINDÉE CPU/GPU ---
+        
+        # 1. Convertir l'index image en entier Python PUR
+        # Si c'est un Tensor GPU, on le ramène sur CPU et on prend sa valeur
+        if isinstance(img_idx, torch.Tensor):
+            img_idx = img_idx.cpu().item()
+            
+        # 2. Générer les indices de pixels EXPLICITEMENT sur CPU
+        # L'argument device='cpu' force la création en RAM, peu importe le default_tensor_type
+        pixels_x = torch.randint(low=0, high=self.W, size=(batch_size,), device='cpu')
+        pixels_y = torch.randint(low=0, high=self.H, size=(batch_size,), device='cpu')
+        
+        # 3. Lire les données (Tout est sur CPU ici : images, index image, indices pixels)
+        # self.images est sur CPU. pixels_x/y sont sur CPU. img_idx est int. -> Pas de crash.
+        color = self.images[img_idx][(pixels_y, pixels_x)]
+        mask = self.masks[img_idx][(pixels_y, pixels_x)]
+        
+        # 4. Envoyer sur GPU pour les calculs géométriques
+        p_x = pixels_x.to(self.device).float()
+        p_y = pixels_y.to(self.device).float()
+        
+        p = torch.stack([p_x, p_y, torch.ones_like(p_y)], dim=-1)
+        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze()
+        
+        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
+        rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()
+        rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape)
+        
+        return torch.cat([rays_o, rays_v, color.to(self.device), mask[:, :1].to(self.device)], dim=-1)
+    
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
         Interpolate pose between two cameras.
