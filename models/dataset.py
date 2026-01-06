@@ -193,3 +193,20 @@ class Dataset:
         near = mid - 1.0
         far = mid + 1.0
         return near, far
+        
+    def image_at(self, idx, resolution_level):
+        if isinstance(idx, torch.Tensor):
+            idx = idx.cpu().item()
+        
+        # On récupère l'image CPU (float 0-1)
+        img = self.images[idx].numpy()
+        
+        # Redimensionnement si nécessaire (pour les images de validation basse résolution)
+        if resolution_level != 1:
+            h, w = img.shape[:2]
+            new_h = h // resolution_level
+            new_w = w // resolution_level
+            # cv2.resize attend (width, height)
+            img = cv.resize(img, (new_w, new_h), interpolation=cv.INTER_AREA)
+            
+        return img
